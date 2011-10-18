@@ -6,12 +6,13 @@
     Reads frostbite2 sb and toc files.  Thanks to gibbed for the original
     analysis of the XOR trick for the obfuscation.
 
-    :copyright: (c) Copyright 2011 by Armin Ronacher.
+    :copyright: (c) Copyright 2011 by Armin Ronacher, Richard Lacharite.
     :license: BSD, see LICENSE for more details.
 """
 import struct
 from array import array
 from itertools import imap
+from pprint import pformat
 
 
 DICE_HEADER = '\x00\xd1\xce\x00'
@@ -21,6 +22,8 @@ MAGIC_OFFSET = 0x0128
 MAGIC_SIZE = 257
 MAGIC_XOR = 0x7b
 DATA_OFFSET = 0x022c
+
+DEBUG = True
 
 
 _structcache = {}
@@ -39,7 +42,59 @@ class TOCException(Exception):
     pass
 
 
-class TOCReader(object):
+class TypeReaderMixin(object):
+
+    def read_st(self, typecode, arch='<'):
+        st = get_cached_struct(arch + typecode)
+        data = self.read(st.size)
+        return st.unpack(data)
+
+    def read_sst(self, typecode, arch='<'):
+        rv = self.read_st(typecode, arch)
+        assert len(rv) == 1, 'Expected exactly one item, got %d' % len(rv)
+        return rv[0]
+
+    def read_varint(self):
+        rv = 0
+        while 1:
+            b = self.read_byte()
+            rv = rv << 8 | b
+            if b <= 127:
+                break
+        return rv
+
+    def read_byte(self):
+        return ord(self.read(1))
+
+    def read_cstring(self):
+        rv = []
+        while 1:
+            c = self.read(1)
+            if c == '\x00':
+                break
+            rv.append(c)
+        return ''.join(rv)
+
+    def read_bstring(self):
+        rv = self.read(self.read_byte())
+        if not rv or rv[-1] != '\x00':
+            raise TOCException('missing bstring delimiter')
+        return rv[:-1]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class TOCReader(TypeReaderMixin):
 
     def __init__(self, fp_or_filename):
         if hasattr(fp_or_filename, 'read'):
@@ -90,86 +145,12 @@ class TOCReader(object):
         self.pos += length
         return data.tostring()
 
-    def read_st(self, typecode, arch='<'):
-        st = get_cached_struct(arch + typecode)
-        data = self.read(st.size)
-        return st.unpack(data)
-
-    def read_sst(self, typecode, arch='<'):
-        rv = self.read_st(typecode, arch)
-        assert len(rv) == 1, 'Expected exactly one item, got %d' % len(rv)
-        return rv[0]
-
-    def read_byte(self):
-        return ord(self.read(1))
-
-    def read_cstring(self):
-        rv = []
-        while 1:
-            c = self.read(1)
-            if c == '\x00':
-                break
-            rv.append(c)
-        return ''.join(rv)
-
-    def read_bstring(self):
-        rv = self.read(self.read_byte())
-        if not rv or rv[-1] != '\x00':
-            raise TOCException('missing bstring delimiter')
-        return rv[:-1]
-
     def close(self):
         if self._managed_fp:
             self._fp.close()
 
-    def __enter__(self):
-        return self
 
-    def __exit__(self, exc_type, exc_value, tb):
-        self.close()
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-def parse_toc_items(reader):
-    header = reader.read(4)
-    toc_type = reader.read_cstring()
-    padding = reader.read(4)
-
-    item = {}
-
-    while 1:
-        typecode = reader.read_byte()
-        if typecode == 0:
-            yield item
-            item = {}
-            # XXX: I am 12 and what is this?
-            garbage = reader.read(2)
-            continue
-        key = reader.read_cstring()
-        if typecode == 7:
-            value = reader.read_bstring()
-        elif typecode == 8:
-            value = reader.read_sst('l')
-        elif typecode == 9:
-            value = reader.read_sst('q')
-        elif typecode == 99:
-            # XXX: end of file?
-            break
-        else:
-            raise TOCException('Unknown typecode %r' % typecode)
-
-        item[key] = value
-
-    if item:
-        yield item
-
-
-class FileDefStream(object):
+class FileDefStream(TypeReaderMixin):
 
     def __init__(self, fp, limit):
         self._fp = fp
@@ -180,33 +161,15 @@ class FileDefStream(object):
         if length is None:
             length = self.limit - self.pos
         rv = self._fp.read(length)
-        self.pos += len(rv)
-        return rv
-
-    def readline(self, length=None):
-        if length is None:
-            length = self.limit - self.pos
-        rv = self._fp.readline(length)
-        self.pos += len(rv)
+        if len(rv) != length:
+            raise TOCException('Unexpected end of file')
+        self.pos += length
         return rv
 
     def close(self):
         if self._fp is not None:
             self._fp.close()
             self._fp = None
-
-    def __iter__(self):
-        while 1:
-            rv = self.readline()
-            if not rv:
-                break
-            yield rv
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, tb):
-        self.close()
 
 
 class FileDef(object):
@@ -230,6 +193,133 @@ class FileDef(object):
         return '<FileDef %r>' % self.id
 
 
+def expect_toc_section(reader, section, skip_limit=16):
+    expected = [1] + map(ord, section) + [0]
+    buffered = []
+    while 1:
+        buffered.append(reader.read_byte())
+        if buffered[-len(expected):] == expected:
+            return reader.read_sst('h')
+        if len(buffered) - len(expected) > skip_limit:
+            raise TOCException('Expected section %s, but did not find it' % section)
+
+
+def parse_toc_items(reader):
+    while 1:
+        marker = reader.read_byte()
+
+        # presumably marker tells us what comes next.  0 means end of item,
+        # 130 means go on
+        if marker == 0:
+            break
+        if marker != 130:
+            raise TOCException('Marker not 130 or 0, marker was %d' % marker)
+
+        # what arg does, I cannot tell...
+        arg = reader.read_byte()
+
+        item = {}
+        while 1:
+            typecode = reader.read_byte()
+            if typecode == 0:
+                break
+            key = reader.read_cstring()
+            if typecode == 6:
+                value = bool(reader.read_byte())
+            elif typecode == 7:
+                value = reader.read_bstring()
+            elif typecode == 8:
+                value = reader.read_sst('l')
+            elif typecode == 9:
+                value = reader.read_sst('q')
+            else:
+                raise TOCException('Unknown typecode %r' % typecode)
+
+            item[key] = value
+
+        yield item
+
+
+class Unknown(object):
+
+    def __init__(self, typecode, value):
+        self.typecode = typecode
+        self.value = value
+
+    def __repr__(self):
+        return '<Unknown %r (typecode=%d)>' % (self.value, self.typecode)
+
+
+class TOCParser(object):
+
+    def __init__(self, reader):
+        self.reader = reader
+        self.stack = []
+
+    def read_object(self, typecode=None):
+        if typecode is None:
+            typecode = self.reader.read_byte()
+        if typecode == 0:
+            self.push(None)
+        elif typecode == 1:
+            self.read_list()
+        elif typecode == 6:
+            self.push(bool(self.reader.read_byte()))
+        elif typecode == 7:
+            self.push(self.reader.read_bstring())
+        elif typecode == 8:
+            self.push(self.reader.read_sst('l'))
+        elif typecode == 9:
+            self.push(self.reader.read_sst('q'))
+        elif typecode == 130:
+            self.read_dict()
+        else:
+            raise TOCException('Unknown typecode %d' % typecode)
+
+    def push(self, obj):
+        self.stack.append(obj)
+
+    def pop(self):
+        return self.stack.pop()
+
+    def peek(self):
+        if self.stack:
+            return self.stack[-1]
+
+    def read_list(self):
+        rv = []
+        self.push(rv)
+        size_info = self.reader.read_varint()
+        # XXX: what is the size info used for?
+
+        while 1:
+            self.read_object()
+            value = self.pop()
+            if value is None:
+                break
+            rv.append(value)
+
+        # at that point, reverse the list
+        rv.reverse()
+
+    def read_dict(self):
+        rv = {}
+        self.push(rv)
+        size_info = self.reader.read_varint()
+        # XXX: what is the size info used for?
+
+        while 1:
+            typecode = self.reader.read_byte()
+            if typecode == 0:
+                break
+            key = self.reader.read_cstring()
+            self.push(key) # for debugging
+            self.read_object(typecode=typecode)
+            value = self.pop()
+            self.pop()
+            rv[key] = value
+
+
 class BundleReader(object):
     """Gives access to a TOC and SB bundle.  Pass it the basename
     (for instance UI, Weapons etc.) and it will add .toc for the TOC
@@ -241,7 +331,19 @@ class BundleReader(object):
 
     def __init__(self, basename):
         self.basename = basename
-        self.files = {}
         with TOCReader(basename + '.toc') as reader:
-            for item in parse_toc_items(reader):
-                self.files[item['id']] = FileDef(self, **item)
+            parser = TOCParser(reader)
+            try:
+                parser.read_object()
+            except TOCException, e:
+                if DEBUG:
+                    import pprint
+                    print 'Parser stack:'
+                    pprint.pprint(parser.stack)
+                raise
+            self.root = parser.pop()
+            assert not parser.stack, 'Parsing error left stack filled'
+
+    def get_file(self, id):
+        """Shortcut to read a file from a bundle."""
+        return FileDef(self, **self.root['bundles'][id])
