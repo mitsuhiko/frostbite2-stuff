@@ -22,6 +22,7 @@ MAGIC_OFFSET = 0x0128
 MAGIC_SIZE = 257
 MAGIC_XOR = 0x7b
 DATA_OFFSET = 0x022c
+CAS_CAT_HEADER = 'Nyan' * 4
 
 
 _structcache = {}
@@ -40,6 +41,10 @@ class TOCException(Exception):
     pass
 
 
+class CASException(Exception):
+    pass
+
+
 class TypeReaderMixin(object):
 
     def read_st(self, typecode, arch='<'):
@@ -53,12 +58,15 @@ class TypeReaderMixin(object):
         return rv[0]
 
     def read_varint(self):
+        # I don't know if that makes sense.  I do not currently use the
+        # values that this function returns
         rv = 0
         while 1:
             b = self.read_byte()
-            rv = rv << 8 | b
             if b <= 127:
+                rv = rv << 7 | b
                 break
+            rv = rv << 8 | b
         return rv
 
     def read_byte(self):
@@ -93,6 +101,11 @@ class TypeReaderMixin(object):
 
 
 class TOCReader(TypeReaderMixin):
+    """Reads a TOC/Superbundle file.  If the file starts with the
+    magic DICE header (00D1CE00) it's xor "encrypted" with the key of
+    the encryption starting at `MAGIC_OFFSET`.  Otherwise it starts
+    reading the data direction from the first byte.
+    """
 
     def __init__(self, fp_or_filename):
         if hasattr(fp_or_filename, 'read'):
@@ -106,25 +119,28 @@ class TOCReader(TypeReaderMixin):
             self.close()
             raise TOCException(message)
 
-        self.header = self._fp.read(len(DICE_HEADER))
-        if self.header != DICE_HEADER:
-            _fail_init('File does not appear to be a TOC file')
+        header = self._fp.read(len(DICE_HEADER))
+        if header != DICE_HEADER:
+            self.hash = None
+            self.magic = None
+            data_offset = 0
+        else:
+            data_offset = DATA_OFFSET
+            self._fp.seek(HASH_OFFSET)
+            if self._fp.read(1) != 'x':
+                _fail_init('Hash start marker not found')
+            self.hash = self._fp.read(HASH_SIZE)
+            if self._fp.read(1) != 'x':
+                _fail_init('Hash end marker not found')
 
-        self._fp.seek(HASH_OFFSET)
-        if self._fp.read(1) != 'x':
-            _fail_init('Hash start marker not found')
-        self.hash = self._fp.read(HASH_SIZE)
-        if self._fp.read(1) != 'x':
-            _fail_init('Hash end marker not found')
-
-        self._fp.seek(MAGIC_OFFSET)
-        self.magic = map(ord, self._fp.read(MAGIC_SIZE))
-        if len(self.magic) != MAGIC_SIZE:
-            _fail_init('Magic incomplete')
+            self._fp.seek(MAGIC_OFFSET)
+            self.magic = map(ord, self._fp.read(MAGIC_SIZE))
+            if len(self.magic) != MAGIC_SIZE:
+                _fail_init('Magic incomplete')
 
         self._fp.seek(0, 2)
-        self.end = self._fp.tell() - DATA_OFFSET
-        self._fp.seek(DATA_OFFSET)
+        self.end = self._fp.tell() - data_offset
+        self._fp.seek(data_offset)
         self.pos = 0
 
     @property
@@ -137,9 +153,10 @@ class TOCReader(TypeReaderMixin):
         data = array('c', self._fp.read(length))
         if len(data) != length:
             raise TOCException('Unexpected end of file')
-        for offset, byte in enumerate(imap(ord, data)):
-            i = self.pos + offset
-            data[offset] = chr(byte ^ self.magic[i % MAGIC_SIZE] ^ MAGIC_XOR)
+        if self.magic is not None:
+            for off, b in enumerate(imap(ord, data)):
+                i = self.pos + off
+                data[off] = chr(b ^ self.magic[i % MAGIC_SIZE] ^ MAGIC_XOR)
         self.pos += length
         return data.tostring()
 
@@ -185,11 +202,7 @@ class BundleFile(object):
     def get_parsed_contents(self):
         with self.open() as f:
             parser = TOCParser(f)
-            try:
-                parser.read_object()
-            except:
-                print parser.stack
-                raise
+            parser.read_object()
             return parser.pop()
 
     def open(self):
@@ -201,18 +214,11 @@ class BundleFile(object):
         return '<FileDef %r>' % self.id
 
 
-def expect_toc_section(reader, section, skip_limit=16):
-    expected = [1] + map(ord, section) + [0]
-    buffered = []
-    while 1:
-        buffered.append(reader.read_byte())
-        if buffered[-len(expected):] == expected:
-            return reader.read_sst('h')
-        if len(buffered) - len(expected) > skip_limit:
-            raise TOCException('Expected section %s, but did not find it' % section)
-
-
 class TOCParser(object):
+    """Parses TOC/Superbundle files.  Each value read is put on on a stack
+    temporarily until something else consumes it.  Even things such as
+    dictionary keys end up on there temporarily to aid debugging.
+    """
 
     def __init__(self, reader):
         self.reader = reader
@@ -239,6 +245,12 @@ class TOCParser(object):
             self.push(self.reader.read(16).encode('hex')) # md5
         elif typecode == 16:
             self.push(self.reader.read(20).encode('hex')) # sha1
+        elif typecode == 19:
+            self.push(self.reader.read_varint())
+        elif typecode == 129:
+            self.read_list()
+            x = self.pop()
+            self.push(x)
         elif typecode == 130:
             self.read_dict()
         elif typecode == 135:
@@ -253,10 +265,6 @@ class TOCParser(object):
 
     def pop(self):
         return self.stack.pop()
-
-    def peek(self):
-        if self.stack:
-            return self.stack[-1]
 
     def read_list(self):
         rv = []
@@ -305,11 +313,7 @@ class BundleReader(object):
         self.basename = basename
         with TOCReader(basename + '.toc') as reader:
             parser = TOCParser(reader)
-            try:
-                parser.read_object()
-            except:
-                print parser.stack
-                raise
+            parser.read_object()
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
 
@@ -322,6 +326,21 @@ class BundleReader(object):
 
     def get_file(self, id):
         """Gets a bundle file."""
+        # O(n) FTL.  Put them into an index on init?
         for bundle in self.root['bundles']:
             if bundle['id'] == id:
                 return BundleFile(self, **bundle)
+
+
+class CASCatalog(TypeReaderMixin):
+    """Not sure yet how to read this."""
+
+    def __init__(self, filename):
+        self._fp = open(filename, 'rb')
+        header = self._fp.read(len(CAS_CAT_HEADER))
+        if header != CAS_CAT_HEADER:
+            self.close()
+            raise CASException('Does not look like a CAS catalog')
+
+    def close(self):
+        self._fp.close()
