@@ -10,6 +10,7 @@
     :license: BSD, see LICENSE for more details.
 """
 import struct
+from uuid import UUID
 from array import array
 from itertools import imap
 from pprint import pformat
@@ -62,11 +63,11 @@ class TypeReaderMixin(object):
         # values that this function returns
         rv = 0
         while 1:
-            b = self.read_byte()
-            if b <= 127:
-                rv = rv << 7 | b
+            val = self.read_byte()
+            first_bit = val >> 7
+            rv = (rv << 7) | (val & 0x7f)
+            if not first_bit:
                 break
-            rv = rv << 8 | b
         return rv
 
     def read_byte(self):
@@ -82,7 +83,7 @@ class TypeReaderMixin(object):
         return ''.join(rv)
 
     def read_bstring(self):
-        rv = self.read(self.read_byte())
+        rv = self.read(self.read_varint())
         if not rv or rv[-1] != '\x00':
             raise TOCException('missing bstring delimiter')
         return rv[:-1]
@@ -214,6 +215,74 @@ class BundleFile(object):
         return '<FileDef %r>' % self.id
 
 
+class PrimitiveWrapper(object):
+    __slots__ = ()
+
+    @property
+    def primitive(self):
+        raise NotImplementedError()
+
+    def __hash__(self):
+        return hash(self.primitive)
+
+    def __eq__(self, other):
+        if type(self) is not type(other):
+            return False
+        return self.primitive == other.primitive
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        return '<%s %s>' % (self.__class__.__name__, self)
+
+
+class BytesPrimitiveWrapper(PrimitiveWrapper):
+    __slots__ = ('bytes',)
+
+    def __init__(self, bytes):
+        self.bytes = bytes
+
+    def __len__(self):
+        return len(self.bytes)
+
+    def __str__(self):
+        return str(self.bytes)
+
+    @property
+    def primitive(self):
+        return self.bytes
+
+
+class Blob(BytesPrimitiveWrapper):
+    """Represents a blob.  So far I have not found a file where the blob is
+    extra large but just in case the repr compresses it.  This mainly exists
+    so that the structure can be reversed without loss of data.
+    """
+    __slots__ = ()
+
+    def __repr__(self):
+        return '<Blob %r (%d bytes)>' % (
+            self.bytes[:16],
+            len(self)
+        )
+
+
+class SHA1(BytesPrimitiveWrapper):
+    """SHA1 hashes are used for content hashes as it seems."""
+    __slots__ = ('bytes',)
+
+    def __init__(self, bytes):
+        self.bytes = bytes
+
+    @property
+    def hex(self):
+        return self.bytes.encode('hex')
+
+    def __repr__(self):
+        return '<SHA1 %s>' % self.hex
+
+
 class TOCParser(object):
     """Parses TOC/Superbundle files.  Each value read is put on on a stack
     temporarily until something else consumes it.  Even things such as
@@ -227,12 +296,16 @@ class TOCParser(object):
     def read_object(self, typecode=None):
         if typecode is None:
             typecode = self.reader.read_byte()
+        raw_typecode = typecode
+        flags = typecode >> 5
+        typecode = typecode & 0x1f
+
         if typecode == 0:
             self.push(None)
         elif typecode == 1:
             self.read_list()
         elif typecode == 2:
-            self.push(self.reader.read_sst('h'))
+            self.read_dict()
         elif typecode == 6:
             self.push(bool(self.reader.read_byte()))
         elif typecode == 7:
@@ -242,23 +315,18 @@ class TOCParser(object):
         elif typecode == 9:
             self.push(self.reader.read_sst('q'))
         elif typecode == 15:
-            self.push(self.reader.read(16).encode('hex')) # md5
+            self.push(UUID(bytes=self.reader.read(16)))
         elif typecode == 16:
-            self.push(self.reader.read(20).encode('hex')) # sha1
+            self.push(SHA1(self.reader.read(20)))
         elif typecode == 19:
-            self.push(self.reader.read_varint())
-        elif typecode == 129:
-            self.read_list()
-            x = self.pop()
-            self.push(x)
-        elif typecode == 130:
-            self.read_dict()
-        elif typecode == 135:
-            # XXX: how is this string different?  I don't know but it's
-            # used in the layout.toc file in the fs list.
-            self.push(self.reader.read_bstring())
+            # XXX: either read_varint is broken or there is some extra
+            # information in there for the blobs.  It fails to read one
+            # of the beta files.
+            size = self.reader.read_varint()
+            self.push(Blob(self.reader.read(size)))
         else:
-            raise TOCException('Unknown typecode %d' % typecode)
+            raise TOCException('Unknown type marker %x (type=%d)' %
+                               (raw_typecode, typecode))
 
     def push(self, obj):
         self.stack.append(obj)
@@ -270,7 +338,7 @@ class TOCParser(object):
         rv = []
         self.push(rv)
         size_info = self.reader.read_varint()
-        # XXX: what is the size info used for?
+        # We don't need the size_info since the collection is delimited
 
         while 1:
             self.read_object()
@@ -286,7 +354,7 @@ class TOCParser(object):
         rv = {}
         self.push(rv)
         size_info = self.reader.read_varint()
-        # XXX: what is the size info used for?
+        # We don't need the size_info since the collection is delimited
 
         while 1:
             typecode = self.reader.read_byte()
