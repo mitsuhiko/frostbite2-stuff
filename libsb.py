@@ -23,8 +23,6 @@ MAGIC_SIZE = 257
 MAGIC_XOR = 0x7b
 DATA_OFFSET = 0x022c
 
-DEBUG = True
-
 
 _structcache = {}
 
@@ -271,6 +269,10 @@ class TOCParser(object):
             self.push(self.reader.read_sst('l'))
         elif typecode == 9:
             self.push(self.reader.read_sst('q'))
+        elif typecode == 15:
+            self.push(self.reader.read(16).encode('hex')) # md5
+        elif typecode == 16:
+            self.push(self.reader.read(20).encode('hex')) # sha1
         elif typecode == 130:
             self.read_dict()
         else:
@@ -333,14 +335,7 @@ class BundleReader(object):
         self.basename = basename
         with TOCReader(basename + '.toc') as reader:
             parser = TOCParser(reader)
-            try:
-                parser.read_object()
-            except TOCException, e:
-                if DEBUG:
-                    import pprint
-                    print 'Parser stack:'
-                    pprint.pprint(parser.stack)
-                raise
+            parser.read_object()
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
 
