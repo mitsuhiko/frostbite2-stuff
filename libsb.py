@@ -238,16 +238,6 @@ def parse_toc_items(reader):
         yield item
 
 
-class Unknown(object):
-
-    def __init__(self, typecode, value):
-        self.typecode = typecode
-        self.value = value
-
-    def __repr__(self):
-        return '<Unknown %r (typecode=%d)>' % (self.value, self.typecode)
-
-
 class TOCParser(object):
 
     def __init__(self, reader):
@@ -315,7 +305,7 @@ class TOCParser(object):
             if typecode == 0:
                 break
             key = self.reader.read_cstring()
-            self.push(key) # for debugging
+            self.push(key) # for debugging, if it blows up the key is on the stack
             self.read_object(typecode=typecode)
             value = self.pop()
             self.pop()
