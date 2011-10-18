@@ -148,7 +148,7 @@ class TOCReader(TypeReaderMixin):
             self._fp.close()
 
 
-class FileDefStream(TypeReaderMixin):
+class BundleFileStream(TypeReaderMixin):
 
     def __init__(self, fp, limit):
         self._fp = fp
@@ -195,7 +195,7 @@ class BundleFile(object):
     def open(self):
         f = open(self.bundle.basename + '.sb', 'rb')
         f.seek(self.offset)
-        return FileDefStream(f, self.size)
+        return BundleFileStream(f, self.size)
 
     def __repr__(self):
         return '<FileDef %r>' % self.id
@@ -241,6 +241,10 @@ class TOCParser(object):
             self.push(self.reader.read(20).encode('hex')) # sha1
         elif typecode == 130:
             self.read_dict()
+        elif typecode == 135:
+            # XXX: how is this string different?  I don't know but it's
+            # used in the layout.toc file in the fs list.
+            self.push(self.reader.read_bstring())
         else:
             raise TOCException('Unknown typecode %d' % typecode)
 
@@ -301,11 +305,22 @@ class BundleReader(object):
         self.basename = basename
         with TOCReader(basename + '.toc') as reader:
             parser = TOCParser(reader)
-            parser.read_object()
+            try:
+                parser.read_object()
+            except:
+                print parser.stack
+                raise
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
 
-    def get_bundle_file(self, id):
+    def list_files(self):
+        """Lists all files in the bundle."""
+        result = []
+        for bundle in self.root['bundles']:
+            result.append(bundle['id'])
+        return result
+
+    def get_file(self, id):
         """Gets a bundle file."""
         for bundle in self.root['bundles']:
             if bundle['id'] == id:
