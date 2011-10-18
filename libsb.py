@@ -14,6 +14,7 @@ from uuid import UUID
 from array import array
 from itertools import imap
 from pprint import pformat
+from datetime import datetime
 
 
 DICE_HEADER = '\x00\xd1\xce\x00'
@@ -59,8 +60,6 @@ class TypeReaderMixin(object):
         return rv[0]
 
     def read_varint(self):
-        # I don't know if that makes sense.  I do not currently use the
-        # values that this function returns
         rv = 0
         while 1:
             val = self.read_byte()
@@ -234,7 +233,10 @@ class PrimitiveWrapper(object):
         return not self.__eq__(other)
 
     def __repr__(self):
-        return '<%s %s>' % (self.__class__.__name__, self)
+        rv = self.primitive
+        if isinstance(rv, basestring):
+            rv = repr(rv)
+        return '<%s %s>' % (self.__class__.__name__, rv)
 
 
 class BytesPrimitiveWrapper(PrimitiveWrapper):
@@ -261,16 +263,10 @@ class Blob(BytesPrimitiveWrapper):
     """
     __slots__ = ()
 
-    def __repr__(self):
-        return '<Blob %r (%d bytes)>' % (
-            self.bytes[:16],
-            len(self)
-        )
-
 
 class SHA1(BytesPrimitiveWrapper):
     """SHA1 hashes are used for content hashes as it seems."""
-    __slots__ = ('bytes',)
+    __slots__ = ()
 
     def __init__(self, bytes):
         self.bytes = bytes
@@ -281,6 +277,14 @@ class SHA1(BytesPrimitiveWrapper):
 
     def __repr__(self):
         return '<SHA1 %s>' % self.hex
+
+
+class Unknown(BytesPrimitiveWrapper):
+    __slots__ = ('code',)
+
+    def __init__(self, code, bytes):
+        self.code = code
+        self.bytes = bytes
 
 
 class TOCParser(object):
