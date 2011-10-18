@@ -170,7 +170,7 @@ class FileDefStream(TypeReaderMixin):
             self._fp = None
 
 
-class FileDef(object):
+class BundleFile(object):
 
     def __init__(self, bundle, id, offset, size):
         self.bundle = bundle
@@ -178,9 +178,19 @@ class FileDef(object):
         self.offset = offset
         self.size = size
 
-    def get_contents(self):
+    def get_raw_contents(self):
         with self.open() as f:
             return f.read()
+
+    def get_parsed_contents(self):
+        with self.open() as f:
+            parser = TOCParser(f)
+            try:
+                parser.read_object()
+            except:
+                print parser.stack
+                raise
+            return parser.pop()
 
     def open(self):
         f = open(self.bundle.basename + '.sb', 'rb')
@@ -202,42 +212,6 @@ def expect_toc_section(reader, section, skip_limit=16):
             raise TOCException('Expected section %s, but did not find it' % section)
 
 
-def parse_toc_items(reader):
-    while 1:
-        marker = reader.read_byte()
-
-        # presumably marker tells us what comes next.  0 means end of item,
-        # 130 means go on
-        if marker == 0:
-            break
-        if marker != 130:
-            raise TOCException('Marker not 130 or 0, marker was %d' % marker)
-
-        # what arg does, I cannot tell...
-        arg = reader.read_byte()
-
-        item = {}
-        while 1:
-            typecode = reader.read_byte()
-            if typecode == 0:
-                break
-            key = reader.read_cstring()
-            if typecode == 6:
-                value = bool(reader.read_byte())
-            elif typecode == 7:
-                value = reader.read_bstring()
-            elif typecode == 8:
-                value = reader.read_sst('l')
-            elif typecode == 9:
-                value = reader.read_sst('q')
-            else:
-                raise TOCException('Unknown typecode %r' % typecode)
-
-            item[key] = value
-
-        yield item
-
-
 class TOCParser(object):
 
     def __init__(self, reader):
@@ -251,6 +225,8 @@ class TOCParser(object):
             self.push(None)
         elif typecode == 1:
             self.read_list()
+        elif typecode == 2:
+            self.push(self.reader.read_sst('h'))
         elif typecode == 6:
             self.push(bool(self.reader.read_byte()))
         elif typecode == 7:
@@ -329,6 +305,8 @@ class BundleReader(object):
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
 
-    def get_file(self, id):
-        """Shortcut to read a file from a bundle."""
-        return FileDef(self, **self.root['bundles'][id])
+    def get_bundle_file(self, id):
+        """Gets a bundle file."""
+        for bundle in self.root['bundles']:
+            if bundle['id'] == id:
+                return BundleFile(self, **bundle)
