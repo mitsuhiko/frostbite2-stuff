@@ -417,6 +417,7 @@ class CASFileReader(TypeReaderMixin):
         else:
             self._fp = open(fp_or_filename, 'rb')
             self._managed_fp = True
+        self.current_file = 0
 
     def read(self, length=None):
         return self._fp.read(length or -1)
@@ -428,8 +429,10 @@ class CASFileReader(TypeReaderMixin):
         hash = self.read(20).encode('hex')
         data_length = self.read_sst('i')
         padding = self.read(4)
-        rv = CASFile(hash, self._fp, self._fp.tell(), data_length)
+        rv = CASFile(hash, self._fp, self._fp.tell(), data_length,
+                     self.current_file)
         self._fp.seek(data_length, 1)
+        self.current_file += 1
         return rv
 
     def __del__(self):
@@ -445,11 +448,12 @@ class CASFileReader(TypeReaderMixin):
 
 class CASFile(object):
 
-    def __init__(self, hash, fp, offset, size):
+    def __init__(self, hash, fp, offset, size, cas_num=-1):
         self.hash = hash
         self.fp = fp
         self.offset = offset
         self.size = size
+        self.cas_num = cas_num
 
     def get_raw_contents(self):
         with self.open() as f:
