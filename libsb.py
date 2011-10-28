@@ -10,10 +10,10 @@
     :license: BSD, see LICENSE for more details.
 """
 import struct
+from StringIO import StringIO
 from uuid import UUID
 from array import array
 from itertools import imap
-from pprint import pformat
 from datetime import datetime
 
 
@@ -63,9 +63,8 @@ class TypeReaderMixin(object):
         rv = 0
         while 1:
             val = self.read_byte()
-            first_bit = val >> 7
             rv = (rv << 7) | (val & 0x7f)
-            if not first_bit:
+            if not val >> 7:
                 break
         return rv
 
@@ -310,6 +309,8 @@ class TOCParser(object):
             self.read_list()
         elif typecode == 2:
             self.read_dict()
+        elif typecode == 5:
+            self.push(Unknown(5, self.reader.read(8)))
         elif typecode == 6:
             self.push(bool(self.reader.read_byte()))
         elif typecode == 7:
@@ -416,3 +417,25 @@ class CASCatalog(TypeReaderMixin):
 
     def close(self):
         self._fp.close()
+
+
+def decrypt(filename, new_filename=None):
+    """Decrypts a file for debugging."""
+    if new_filename is None:
+        new_filename = filename + '.decrypt'
+    with open(new_filename, 'wb') as f:
+        with TOCReader(filename) as reader:
+            f.write(reader.read())
+
+
+def loads(string):
+    """Quick"""
+    return load(StringIO(string))
+
+
+def load(filename_or_fp):
+    """Loads a TOC object from a file."""
+    with TOCReader(filename_or_fp) as reader:
+        parser = TOCParser(reader)
+        parser.read_object()
+        return parser.pop()
