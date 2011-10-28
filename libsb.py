@@ -197,16 +197,28 @@ class BundleFile(object):
         self.id = id
         self.offset = offset
         self.size = size
+        self._parsed_contents = None
 
     def get_raw_contents(self):
         with self.open() as f:
             return f.read()
 
     def get_parsed_contents(self):
+        if self._parsed_contents is not None:
+            return self._parsed_contents
         with self.open() as f:
             parser = SBParser(f)
             parser.read_object()
-            return parser.pop()
+            rv = parser.pop()
+            self._parsed_contents = rv
+            return rv
+
+    def iter_chunk_files(self):
+        if self.bundle.cat is None:
+            raise RuntimeError('Catalog not loaded')
+        meta = self.get_parsed_contents()
+        for chunk in meta['chunks']:
+            yield chunk['id'], self.bundle.cat.get_file(chunk['sha1'].hex)
 
     def open(self):
         f = open(self.bundle.basename + '.sb', 'rb')
@@ -377,7 +389,7 @@ class SBParser(object):
             rv[key] = value
 
 
-class BundleReader(object):
+class Bundle(object):
     """Gives access to a SB and SB bundle.  Pass it the basename
     (for instance UI, Weapons etc.) and it will add .toc for the SB
     and .sb for the actual contents.
@@ -386,13 +398,19 @@ class BundleReader(object):
     The contents of those files are not yet parsed.
     """
 
-    def __init__(self, basename):
+    def __init__(self, basename, cat=None):
         self.basename = basename
+        self.cat = cat
+        self.bundle_files = {}
         with SBReader(basename + '.toc') as reader:
             parser = SBParser(reader)
             parser.read_object()
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
+
+        for bundle in self.root['bundles']:
+            if 'size' in bundle and 'offset' in bundle:
+                self.bundle_files[bundle['id']] = BundleFile(self, **bundle)
 
     def list_files(self):
         """Lists all files in the bundle."""
@@ -402,11 +420,8 @@ class BundleReader(object):
         return result
 
     def get_file(self, id):
-        """Gets a bundle file."""
-        # O(n) FTL.  Put them into an index on init?
-        for bundle in self.root['bundles']:
-            if bundle['id'] == id:
-                return BundleFile(self, **bundle)
+        """Opens a file by id."""
+        return self.bundle_files[id]
 
 
 class CASFileReader(TypeReaderMixin):
@@ -432,10 +447,10 @@ class CASFileReader(TypeReaderMixin):
             raise EOFError()
         if header != CAS_HEADER:
             raise ValueError('Expected cas header, got %r' % header)
-        hash = self.read(20).encode('hex')
+        sha1 = SHA1(self.read(20))
         data_length = self.read_sst('i')
         padding = self.read(4)
-        rv = CASFile(hash, self._fp.tell(), data_length, fp=self._fp)
+        rv = CASFile(sha1, self._fp.tell(), data_length, fp=self._fp)
         self._fp.seek(data_length, 1)
         return rv
 
@@ -460,9 +475,9 @@ class CASFileReader(TypeReaderMixin):
 class CASFile(object):
     """A single file from a CAS."""
 
-    def __init__(self, hash, offset, size, cas_num=-1,
+    def __init__(self, sha1, offset, size, cas_num=-1,
                  cat=None, fp=None):
-        self.hash = hash
+        self.sha1 = sha1
         self.fp = fp
         self.offset = offset
         self.size = size
@@ -482,7 +497,7 @@ class CASFile(object):
         return BundleFileStream(f, self.size)
 
     def __repr__(self):
-        return '<CASFile %r>' % self.hash
+        return '<CASFile %r>' % self.sha1.hex
 
 
 class CASCatalog(object):
@@ -497,15 +512,15 @@ class CASCatalog(object):
             if header != CAS_CAT_HEADER:
                 raise ValueError('Not a cas cat file')
             while not reader.eof:
-                hash = reader.read(20).encode('hex')
+                sha1 = SHA1(reader.read(20))
                 offset = reader.read_sst('i')
                 size = reader.read_sst('i')
                 cas_num = reader.read_sst('i')
-                self.files[hash] = CASFile(hash, offset, size, cas_num,
-                                           cat=self)
+                self.files[sha1.hex] = CASFile(sha1, offset, size, cas_num,
+                                               cat=self)
 
-    def get_file(self, hash):
-        return self.files[hash]
+    def get_file(self, sha1):
+        return self.files[sha1]
 
     def read(self, length=None):
         return self._fp.read(length or -1)

@@ -4,13 +4,20 @@ from libsb import CASCatalog
 
 
 def dump_all(source, dst):
-    if not os.path.isdir(dst):
-        os.makedirs(dst)
-
+    print 'Reading catalog...'
     cat = CASCatalog(source)
-    for hash, file in cat.files.iteritems():
-        with open(os.path.join(dst, hash), 'wb') as out:
-            print 'Extracting', hash
+    idx = 0
+    total = len(cat.files)
+    print 'Found %d files' % total
+
+    for idx, (hash, file) in enumerate(cat.files.iteritems()):
+        fn = os.path.join(dst, hash[0], hash[:2], hash)
+        directory = os.path.dirname(fn)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(fn, 'wb') as out:
+            print 'Extracting %s % 8d Bytes cas=%02d (%d/%d)' % \
+                (hash, file.size, file.cas_num, idx, total)
             shutil.copyfileobj(file.open(), out)
 
 
