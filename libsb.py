@@ -26,6 +26,7 @@ MAGIC_SIZE = 257
 MAGIC_XOR = 0x7b
 DATA_OFFSET = 0x022c
 CAS_CAT_HEADER = 'Nyan' * 4
+CAS_HEADER = '\xfa\xce\x0f\xf0'
 
 
 _structcache = {}
@@ -422,9 +423,14 @@ class CASFileReader(TypeReaderMixin):
 
     def get_next_file(self):
         header = self.read(4)
+        if header != CAS_HEADER:
+            raise ValueError('Expected cas header, got %r' % header)
         hash = self.read(20).encode('hex')
-        data_length = self.read_sst('q')
-        return CASFile(hash, self._fp, data_length)
+        data_length = self.read_sst('i')
+        padding = self.read(4)
+        rv = CASFile(hash, self._fp, self._fp.tell(), data_length)
+        self._fp.seek(data_length, 1)
+        return rv
 
     def __del__(self):
         try:
@@ -439,10 +445,10 @@ class CASFileReader(TypeReaderMixin):
 
 class CASFile(object):
 
-    def __init__(self, hash, fp, size):
+    def __init__(self, hash, fp, offset, size):
         self.hash = hash
         self.fp = fp
-        self.offset = fp.tell()
+        self.offset = offset
         self.size = size
 
     def get_raw_contents(self):
