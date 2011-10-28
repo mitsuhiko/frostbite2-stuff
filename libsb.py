@@ -176,6 +176,8 @@ class BundleFileStream(TypeReaderMixin):
     def read(self, length=None):
         if length is None:
             length = self.limit - self.pos
+        else:
+            length = min(length, self.limit - self.pos)
         rv = self._fp.read(length)
         if len(rv) != length:
             raise SBException('Unexpected end of file')
