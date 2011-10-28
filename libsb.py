@@ -9,6 +9,7 @@
     :copyright: (c) Copyright 2011 by Armin Ronacher, Richard Lacharite, Pilate.
     :license: BSD, see LICENSE for more details.
 """
+import os
 import struct
 from StringIO import StringIO
 from uuid import UUID
@@ -415,18 +416,15 @@ class CASFileReader(TypeReaderMixin):
         else:
             self._fp = open(fp_or_filename, 'rb')
             self._managed_fp = True
-        self._pos = 0
 
-    def read(self, lenght=None):
-        rv = self._fp.read(length or -1)
-        self._pos += rv
-        return rv
+    def read(self, length=None):
+        return self._fp.read(length or -1)
 
     def get_next_file(self):
         header = self.read(4)
         hash = self.read(20).encode('hex')
-        data_length = self.read_sst('i')
-        return CASFile(hash, self._fp, self._pos, data_length)
+        data_length = self.read_sst('q')
+        return CASFile(hash, self._fp, data_length)
 
     def __del__(self):
         try:
@@ -441,10 +439,10 @@ class CASFileReader(TypeReaderMixin):
 
 class CASFile(object):
 
-    def __init__(self, hash, fp, offset, size):
+    def __init__(self, hash, fp, size):
         self.hash = hash
         self.fp = fp
-        self.offset = offset
+        self.offset = fp.tell()
         self.size = size
 
     def get_raw_contents(self):
@@ -457,7 +455,7 @@ class CASFile(object):
         return BundleFileStream(f, self.size)
 
     def __repr__(self):
-        return '<CASFile %r>' % self.id
+        return '<CASFile %r>' % self.hash
 
 
 class CASCatalog(TypeReaderMixin):
