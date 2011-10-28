@@ -6,7 +6,7 @@
     Reads frostbite2 sb and toc files.  Thanks to gibbed for the original
     analysis of the XOR trick for the obfuscation.
 
-    :copyright: (c) Copyright 2011 by Armin Ronacher, Richard Lacharite.
+    :copyright: (c) Copyright 2011 by Armin Ronacher, Richard Lacharite, Pilate.
     :license: BSD, see LICENSE for more details.
 """
 import struct
@@ -210,7 +210,7 @@ class BundleFile(object):
         return BundleFileStream(f, self.size)
 
     def __repr__(self):
-        return '<FileDef %r>' % self.id
+        return '<BundleFile %r>' % self.id
 
 
 class PrimitiveWrapper(object):
@@ -403,6 +403,61 @@ class BundleReader(object):
         for bundle in self.root['bundles']:
             if bundle['id'] == id:
                 return BundleFile(self, **bundle)
+
+
+class CASFileReader(TypeReaderMixin):
+    """Reads CAS files."""
+
+    def __init__(self, fp_or_filename):
+        if hasattr(fp_or_filename, 'read'):
+            self._fp = fp_or_filename
+            self._managed_fp = False
+        else:
+            self._fp = open(fp_or_filename, 'rb')
+            self._managed_fp = True
+        self._pos = 0
+
+    def read(self, lenght=None):
+        rv = self._fp.read(length or -1)
+        self._pos += rv
+        return rv
+
+    def get_next_file(self):
+        header = self.read(4)
+        hash = self.read(20).encode('hex')
+        data_length = self.read_sst('i')
+        return CASFile(hash, self._fp, self._pos, data_length)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self):
+        if self._managed_fp:
+            self._fp.close()
+
+
+class CASFile(object):
+
+    def __init__(self, hash, fp, offset, size):
+        self.hash = hash
+        self.fp = fp
+        self.offset = offset
+        self.size = size
+
+    def get_raw_contents(self):
+        with self.open() as f:
+            return f.read()
+
+    def open(self):
+        f = os.fdopen(os.dup(self.fp.fileno()))
+        f.seek(self.offset)
+        return BundleFileStream(f, self.size)
+
+    def __repr__(self):
+        return '<CASFile %r>' % self.id
 
 
 class CASCatalog(TypeReaderMixin):
