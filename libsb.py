@@ -41,7 +41,7 @@ def get_cached_struct(typecode):
     return rv
 
 
-class TOCException(Exception):
+class SBException(Exception):
     pass
 
 
@@ -85,7 +85,7 @@ class TypeReaderMixin(object):
     def read_bstring(self):
         rv = self.read(self.read_varint())
         if not rv or rv[-1] != '\x00':
-            raise TOCException('missing bstring delimiter')
+            raise SBException('missing bstring delimiter')
         return rv[:-1]
 
     def __enter__(self):
@@ -101,8 +101,8 @@ class TypeReaderMixin(object):
             pass
 
 
-class TOCReader(TypeReaderMixin):
-    """Reads a TOC/Superbundle file.  If the file starts with the
+class SBReader(TypeReaderMixin):
+    """Reads optionally encrypted files.  If the file starts with the
     magic DICE header (00D1CE00) it's xor "encrypted" with the key of
     the encryption starting at `MAGIC_OFFSET`.  Otherwise it starts
     reading the data direction from the first byte.
@@ -118,7 +118,7 @@ class TOCReader(TypeReaderMixin):
 
         def _fail_init(message):
             self.close()
-            raise TOCException(message)
+            raise SBException(message)
 
         header = self._fp.read(len(DICE_HEADER))
         if header != DICE_HEADER:
@@ -153,7 +153,7 @@ class TOCReader(TypeReaderMixin):
             length = self.end - self.pos
         data = array('c', self._fp.read(length))
         if len(data) != length:
-            raise TOCException('Unexpected end of file')
+            raise SBException('Unexpected end of file')
         if self.magic is not None:
             for off, b in enumerate(imap(ord, data)):
                 i = self.pos + off
@@ -178,7 +178,7 @@ class BundleFileStream(TypeReaderMixin):
             length = self.limit - self.pos
         rv = self._fp.read(length)
         if len(rv) != length:
-            raise TOCException('Unexpected end of file')
+            raise SBException('Unexpected end of file')
         self.pos += length
         return rv
 
@@ -202,7 +202,7 @@ class BundleFile(object):
 
     def get_parsed_contents(self):
         with self.open() as f:
-            parser = TOCParser(f)
+            parser = SBParser(f)
             parser.read_object()
             return parser.pop()
 
@@ -288,8 +288,8 @@ class Unknown(BytesPrimitiveWrapper):
         self.bytes = bytes
 
 
-class TOCParser(object):
-    """Parses TOC/Superbundle files.  Each value read is put on on a stack
+class SBParser(object):
+    """Parses SB/Superbundle files.  Each value read is put on on a stack
     temporarily until something else consumes it.  Even things such as
     dictionary keys end up on there temporarily to aid debugging.
     """
@@ -332,7 +332,7 @@ class TOCParser(object):
             size = self.reader.read_varint()
             self.push(Blob(self.reader.read(size)))
         else:
-            raise TOCException('Unknown type marker %x (type=%d)' %
+            raise SBException('Unknown type marker %x (type=%d)' %
                                (raw_typecode, typecode))
 
     def push(self, obj):
@@ -376,8 +376,8 @@ class TOCParser(object):
 
 
 class BundleReader(object):
-    """Gives access to a TOC and SB bundle.  Pass it the basename
-    (for instance UI, Weapons etc.) and it will add .toc for the TOC
+    """Gives access to a SB and SB bundle.  Pass it the basename
+    (for instance UI, Weapons etc.) and it will add .toc for the SB
     and .sb for the actual contents.
 
     :attr:`files` gives access to all files by id in a sanish way.
@@ -386,8 +386,8 @@ class BundleReader(object):
 
     def __init__(self, basename):
         self.basename = basename
-        with TOCReader(basename + '.toc') as reader:
-            parser = TOCParser(reader)
+        with SBReader(basename + '.toc') as reader:
+            parser = SBParser(reader)
             parser.read_object()
             self.root = parser.pop()
             assert not parser.stack, 'Parsing error left stack filled'
@@ -408,7 +408,10 @@ class BundleReader(object):
 
 
 class CASFileReader(TypeReaderMixin):
-    """Reads CAS files."""
+    """Reads CAS files without the help of the catalog.  This is mainly
+    useful for dumping everything in case someone forgot to add an entry
+    into the .cat.  It can only read one file after another.
+    """
 
     def __init__(self, fp_or_filename):
         if hasattr(fp_or_filename, 'read'):
@@ -417,23 +420,29 @@ class CASFileReader(TypeReaderMixin):
         else:
             self._fp = open(fp_or_filename, 'rb')
             self._managed_fp = True
-        self.current_file = 0
 
     def read(self, length=None):
         return self._fp.read(length or -1)
 
     def get_next_file(self):
         header = self.read(4)
+        if not header:
+            raise EOFError()
         if header != CAS_HEADER:
             raise ValueError('Expected cas header, got %r' % header)
         hash = self.read(20).encode('hex')
         data_length = self.read_sst('i')
         padding = self.read(4)
-        rv = CASFile(hash, self._fp, self._fp.tell(), data_length,
-                     self.current_file)
+        rv = CASFile(hash, self._fp.tell(), data_length, fp=self._fp)
         self._fp.seek(data_length, 1)
-        self.current_file += 1
         return rv
+
+    def __iter__(self):
+        while 1:
+            try:
+                yield self.get_next_file()
+            except EOFError:
+                break
 
     def __del__(self):
         try:
@@ -447,20 +456,26 @@ class CASFileReader(TypeReaderMixin):
 
 
 class CASFile(object):
+    """A single file from a CAS."""
 
-    def __init__(self, hash, fp, offset, size, cas_num=-1):
+    def __init__(self, hash, offset, size, cas_num=-1,
+                 cat=None, fp=None):
         self.hash = hash
         self.fp = fp
         self.offset = offset
         self.size = size
         self.cas_num = cas_num
+        self.cat = cat
 
     def get_raw_contents(self):
         with self.open() as f:
             return f.read()
 
     def open(self):
-        f = os.fdopen(os.dup(self.fp.fileno()))
+        if self.fp is not None:
+            f = os.fdopen(os.dup(self.fp.fileno()))
+        else:
+            f = self.cat.open_cas(self.cas_num)
         f.seek(self.offset)
         return BundleFileStream(f, self.size)
 
@@ -468,18 +483,36 @@ class CASFile(object):
         return '<CASFile %r>' % self.hash
 
 
-class CASCatalog(TypeReaderMixin):
-    """Not sure yet how to read this."""
+class CASCatalog(object):
+    """Reads CAT files."""
 
     def __init__(self, filename):
-        self._fp = open(filename, 'rb')
-        header = self._fp.read(len(CAS_CAT_HEADER))
-        if header != CAS_CAT_HEADER:
-            self.close()
-            raise CASException('Does not look like a CAS catalog')
+        self.filename = os.path.abspath(filename)
+        self.files = {}
+        with open(filename, 'rb') as f:
+            reader = SBReader(f)
+            header = reader.read(len(CAS_CAT_HEADER))
+            if header != CAS_CAT_HEADER:
+                raise ValueError('Not a cas cat file')
+            while not reader.eof:
+                hash = reader.read(20).encode('hex')
+                offset = reader.read_sst('i')
+                size = reader.read_sst('i')
+                cas_num = reader.read_sst('i')
+                self.files[hash] = CASFile(hash, offset, size, cas_num,
+                                           cat=self)
 
-    def close(self):
-        self._fp.close()
+    def get_file(self, hash):
+        return self.files[hash]
+
+    def read(self, length=None):
+        return self._fp.read(length or -1)
+
+    def open_cas(self, num):
+        directory, base = os.path.split(self.filename)
+        filename = '%s_%02d.cas' % (os.path.splitext(base)[0], num)
+        full_filename = os.path.join(directory, filename)
+        return open(full_filename, 'rb')
 
 
 def decrypt(filename, new_filename=None):
@@ -487,7 +520,7 @@ def decrypt(filename, new_filename=None):
     if new_filename is None:
         new_filename = filename + '.decrypt'
     with open(new_filename, 'wb') as f:
-        with TOCReader(filename) as reader:
+        with SBReader(filename) as reader:
             f.write(reader.read())
 
 
@@ -497,8 +530,8 @@ def loads(string):
 
 
 def load(filename_or_fp):
-    """Loads a TOC object from a file."""
-    with TOCReader(filename_or_fp) as reader:
-        parser = TOCParser(reader)
+    """Loads an SB object from a file."""
+    with SBReader(filename_or_fp) as reader:
+        parser = SBParser(reader)
         parser.read_object()
         return parser.pop()
