@@ -359,9 +359,8 @@ class SBParser(object):
         rv = []
         self.push(rv)
         size_info = self.reader.read_varint()
-        # We don't need the size_info since the collection is delimited
 
-        while 1:
+        for x in xrange(size_info):
             self.read_object()
             value = self.pop()
             if value is None:
@@ -377,7 +376,7 @@ class SBParser(object):
         size_info = self.reader.read_varint()
         # We don't need the size_info since the collection is delimited
 
-        while 1:
+        for x in xrange(size_info):
             typecode = self.reader.read_byte()
             if typecode == 0:
                 break

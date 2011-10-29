@@ -1,0 +1,135 @@
+
+
+    \ | /
+   - < > -    Frostbite2 Stuff
+     | |
+
+  This repository contains libraries that access various
+  formats that Battlefield 3 uses.  Currently it reads most
+  of the .sb/.toc/.m/.cas and .cat files as well as the
+  usersettings of the game.
+
+
+  // Superbundle Files
+
+    - Overall Format
+
+      I don't know how the engine calls these files internally
+      but they are by far the most common file format that
+      Frostbite 2 has.  They exist in two formats: unencrypted
+      and signed and XOR encrypted.  To keep them apart from
+      each other the engine seems to use the 4 byte header
+      00D1CE00 at the beginning of files.
+
+      If a file starts with 00D1CE00 a hash will be located at
+      0x08 in the file and start with the ascii letter "x",
+      then 256 ascii letters which are the hash and then again
+      the letter "x".  What this hash is used for I do not know.
+
+      The lookup table for the XOR encryption then is located
+      at 0x0128 and is 257 characters long.  It is followed by
+      XOR encrypted data.  For each character read the following
+      decryption has to be applied:
+
+        for (int i = 0; i < data_size; i++)
+          data[i] = data[i] ^ magic[i % 257] ^ 0x7b;
+
+      If the file does not start with that header the payload
+      starts at byte zero directly.
+
+    - File Format Description
+
+      The file can be described as a form of binary JSON.  It
+      generally is a nested structure of dictionarys or lists
+      and some scalar types as well as strings and blobs.
+
+      Each object is prefixed with a typecode and some flags:
+
+        uint8 byte = read_single_byte();
+        int flags = byte >> 5;
+        int typecode = byte & 0x1f;
+
+      I don't know what the flags are doing but for reading the
+      files it seems that you can ignore them.  The following
+      typecodes exist:
+
+        0           None / nil
+        1           List
+        2           Dict
+        5           Unknown (8 bytes)
+        6           Bool
+        7           Binary String
+        8           int32
+        9           int64
+        15          UUID
+        16          SHA1
+        19          Variable Length Quantity (varint)
+
+      Strings are prefixed with the number of bytes as varint.
+      Lists and dicts are prefixed with the number of elements
+      they contain of but they are also delimited by `None` at
+      the end.
+
+      Dicts are interesting in that they move the typecode of
+      the value of the dict before the key which means that
+      you need to read "typecode key value" where value is no
+      longer prefixed with a typecode.
+
+  // CAS / CAT files
+
+    - CAS File Format
+
+      CAS files are the data source for everything the engine
+      reads.  All the assets are stored in CAS files.  The CAS
+      files by themselves can be dumped to the filesystem
+      without the help of the CAT file but finding things in
+      that file would be O(n) as such the CAT file exists which
+      is a catalog of all the CAS files.
+
+      struct entry {
+          char header[4];
+          char sha1[20];
+          int32 data_length;
+          char padding[4];
+      };
+
+      The header for all entries in the CAS file are always
+      FACE0FF0.
+
+    - CAT File Format
+
+      CAS Catalogs are very similar.  They start with the
+      header "NyanNyanNyanNyan" and after that they list all
+      the contents of all CAS files with the additional
+      information of position, size and which CAS file they
+      are from:
+
+      struct entry {
+          char sha1[20];
+          int32 offset;
+          int32 size;
+          int32 cas_num;
+      }
+
+      The cas num is the name of the cas file.  "2" would
+      indicate "cas_02.cas" etc.
+
+  // How Does The Engine Find Stuff?
+
+    - File Identifiers
+
+      The sha1 hashes in the CAS/CAT are the SHA1 hash of the
+      contents of the file.  This is also how the engine looks
+      them up which indicates that it does not do a md5 hash
+      of the filename.  The .toc/.sb files in combination have
+      UUIDs for bundles which then have a bunch of SHA1 hashes
+      which point to files in the CAS files.
+
+      Additionally there is a bom.fb2 file which seems to be
+      unused by the game.  Once decrypted with the algorithm
+      from above it exposes a zip file made up of .m files
+      which point to various parts in the archives.  Yet the
+      patch does not have such a bom.fb2 file.
+
+
+
