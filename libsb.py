@@ -14,7 +14,7 @@ import struct
 from StringIO import StringIO
 from uuid import UUID
 from array import array
-from itertools import imap
+from itertools import imap, count
 from datetime import datetime
 
 
@@ -62,11 +62,12 @@ class TypeReaderMixin(object):
         return rv[0]
 
     def read_varint(self):
-        byte = self.read_byte()
-        rv = byte & 0x7f
-        while byte >> 7:
+        rv = 0
+        for idx in count():
             byte = self.read_byte()
-            rv = ((byte & 0x7f) << 7) | rv
+            rv |= (byte & 0x7f) << (7 * idx)
+            if not byte >> 7:
+                break
         return rv
 
     def read_byte(self):
