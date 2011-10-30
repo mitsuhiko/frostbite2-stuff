@@ -14,7 +14,7 @@ import struct
 from StringIO import StringIO
 from uuid import UUID
 from array import array
-from itertools import imap, count
+from itertools import imap, count, izip, chain
 from datetime import datetime
 
 
@@ -39,6 +39,10 @@ def get_cached_struct(typecode):
     if rv is None:
         _structcache[typecode] = rv = struct.Struct(typecode)
     return rv
+
+
+def generate_one(item):
+    yield item
 
 
 class SBException(Exception):
@@ -207,10 +211,7 @@ class BundleFile(object):
         if self._parsed_contents is not None:
             return self._parsed_contents
         with self.open() as f:
-            parser = SBParser(f)
-            parser.read_object()
-            rv = parser.pop()
-            self._parsed_contents = rv
+            self._parsed_contents = rv = load(f)
             return rv
 
     def iter_chunk_files(self):
@@ -307,7 +308,103 @@ class SBParser(object):
 
     def __init__(self, reader):
         self.reader = reader
-        self.stack = []
+
+    def parse(self):
+        """Parse a single object from the reader."""
+        gen = self.read_object()
+        rv = self.make_object(gen)
+        try:
+            gen.next()
+        except StopIteration:
+            return rv
+        raise RuntimeError('Garbage left in stream')
+
+    def iterparse(self, selector=None):
+        """Parses objects that are below one of the selector."""
+        if not callable(selector):
+            selector = self.make_selector_function(selector)
+
+        iterator = self.read_object()
+        stack = []
+
+        for event in iterator:
+            event_type, event_value = event
+            if event_type in ('list_start', 'dict_start'):
+                if selector(stack):
+                    yield self.make_object(chain([event], iterator))
+                else:
+                    stack.append(None)
+            elif event_type in ('list_item', 'dict_key'):
+                stack[-1] = event_value
+            elif event_type in ('dict_end', 'list_end'):
+                stack.pop()
+            elif selector(stack):
+                yield self.make_object(chain([event], iterator))
+
+    def make_selector_function(self, selector):
+        if isinstance(selector, basestring):
+            selector = [x.strip() for x in selector.split(',')]
+        selectors = [self.parse_selector(x) for x in selector]
+
+        def selector_matches(selector, stack):
+            if len(stack) != len(selector):
+                return False
+            for stack_part, selector_part in izip(stack, selector):
+                if selector_part is not None and \
+                   selector_part != stack_part:
+                    return False
+            return True
+
+        def selector_func(stack):
+            for selector in selectors:
+                if selector_matches(selector, stack):
+                    return True
+            return False
+        return selector_func
+
+    def parse_selector(self, selector):
+        test_selector = []
+        for part in selector.split('.'):
+            if part == '*':
+                test_selector.append(None)
+            elif part.isdigit():
+                test_selector.append(int(part))
+            else:
+                test_selector.append(part)
+        return test_selector
+
+    def make_object(self, iterator):
+        event_type, event_value = iterator.next()
+        if event_type == 'value':
+            return event_value
+        elif event_type == 'list_start':
+            rv = []
+            for event in iterator:
+                if event[0] == 'list_end':
+                    break
+                assert event[0] == 'list_item', 'expected list item'
+                rv.append(self.make_object(iterator))
+            return rv
+        elif event_type == 'dict_start':
+            rv = {}
+            for event in iterator:
+                if event[0] == 'dict_end':
+                    break
+                assert event[0] == 'dict_key', 'expected dict key'
+                key = event[1]
+                value = self.make_object(iterator)
+                rv[key] = value
+            return rv
+        elif event_type == 'blob_start':
+            rv = []
+            for event in iterator:
+                if event[0] == 'blob_end':
+                    break
+                assert event[0] == 'blob_chunk', 'expected blob chunk'
+                rv.append(event[1])
+            return Blob(''.join(rv))
+        else:
+            raise RuntimeError('Unexpected event %r' % event_type)
 
     def read_object(self, typecode=None):
         if typecode is None:
@@ -317,70 +414,74 @@ class SBParser(object):
         typecode = typecode & 0x1f
 
         if typecode == 0:
-            self.push(None)
+            yield 'value', None
         elif typecode == 1:
-            self.read_list()
+            for event in self.read_list():
+                yield event
         elif typecode == 2:
-            self.read_dict()
+            for event in self.read_dict():
+                yield event
         elif typecode == 5:
-            self.push(Unknown(5, self.reader.read(8)))
+            yield 'value', Unknown(5, self.reader.read(8))
         elif typecode == 6:
-            self.push(bool(self.reader.read_byte()))
+            yield 'value', bool(self.reader.read_byte())
         elif typecode == 7:
-            self.push(self.reader.read_bstring())
+            yield 'value', self.reader.read_bstring()
         elif typecode == 8:
-            self.push(self.reader.read_sst('l'))
+            yield 'value', self.reader.read_sst('l')
         elif typecode == 9:
-            self.push(self.reader.read_sst('q'))
+            yield 'value', self.reader.read_sst('q')
         elif typecode == 15:
-            self.push(UUID(bytes=self.reader.read(16)))
+            yield 'value', UUID(bytes=self.reader.read(16))
         elif typecode == 16:
-            self.push(SHA1(self.reader.read(20)))
+            yield 'value', SHA1(self.reader.read(20))
         elif typecode == 19:
-            size = self.reader.read_varint()
-            self.push(Blob(self.reader.read(size)))
+            for event in self.read_blob():
+                yield event
         else:
             raise SBException('Unknown type marker %x (type=%d)' %
                                (raw_typecode, typecode))
 
-    def push(self, obj):
-        self.stack.append(obj)
-
-    def pop(self):
-        return self.stack.pop()
-
     def read_list(self):
-        rv = []
-        self.push(rv)
         size_info = self.reader.read_varint()
         # We don't need the size_info since the collection is delimited
+        yield 'list_start', None
 
+        idx = 0
         while 1:
-            self.read_object()
-            value = self.pop()
-            if value is None:
+            typecode = self.reader.read_byte()
+            if typecode == 0:
                 break
-            rv.append(value)
+            yield 'list_item', idx
+            for event in self.read_object(typecode):
+                yield event
+            idx += 1
 
-        # at that point, reverse the list
-        rv.reverse()
+        yield 'list_end', None
 
     def read_dict(self):
-        rv = {}
-        self.push(rv)
         size_info = self.reader.read_varint()
         # We don't need the size_info since the collection is delimited
+        yield 'dict_start', None
 
         while 1:
             typecode = self.reader.read_byte()
             if typecode == 0:
                 break
-            key = self.reader.read_cstring()
-            self.push(key) # for debugging, if it blows up the key is on the stack
-            self.read_object(typecode=typecode)
-            value = self.pop()
-            self.pop()
-            rv[key] = value
+            yield 'dict_key', self.reader.read_cstring()
+            for event in self.read_object(typecode=typecode):
+                yield event
+
+        yield 'dict_end', None
+
+    def read_blob(self):
+        to_read = self.reader.read_varint()
+        yield 'blob_start', to_read
+        while to_read > 0:
+            read_now = min(to_read, 4096)
+            yield 'blob_chunk', self.reader.read(read_now)
+            to_read -= read_now
+        yield 'blob_end', None
 
 
 class Bundle(object):
@@ -396,11 +497,7 @@ class Bundle(object):
         self.basename = basename
         self.cat = cat
         self.bundle_files = {}
-        with SBReader(basename + '.toc') as reader:
-            parser = SBParser(reader)
-            parser.read_object()
-            self.root = parser.pop()
-            assert not parser.stack, 'Parsing error left stack filled'
+        self.root = load(basename + '.toc')
 
         for bundle in self.root['bundles']:
             if 'size' in bundle and 'offset' in bundle:
@@ -536,13 +633,23 @@ def decrypt(filename, new_filename=None):
 
 
 def loads(string):
-    """Quick"""
+    """Loads an SB object from a string."""
     return load(StringIO(string))
 
 
 def load(filename_or_fp):
     """Loads an SB object from a file."""
     with SBReader(filename_or_fp) as reader:
-        parser = SBParser(reader)
-        parser.read_object()
-        return parser.pop()
+        return SBParser(reader).parse()
+
+
+def iterloads(string, selector):
+    """Loads SB objects iteratively from from a string that match a selector."""
+    return iterload(StringIO(string), selector)
+
+
+def iterload(filename_or_fp, selector):
+    """Loads SB objects iteratively from from a file that match a selector."""
+    with SBReader(filename_or_fp) as reader:
+        for obj in SBParser(reader).iterparse(selector):
+            yield obj
