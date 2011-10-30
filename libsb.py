@@ -62,16 +62,11 @@ class TypeReaderMixin(object):
         return rv[0]
 
     def read_varint(self):
-        rv = 0
-        while 1:
+        byte = self.read_byte()
+        rv = byte & 0x7f
+        while byte >> 7:
             byte = self.read_byte()
-            val = byte & 0x7f
-            if rv == 0:
-                rv = val
-            else:
-                rv = (val << 7) | rv
-            if not byte >> 7:
-                break
+            rv = ((byte & 0x7f) << 7) | rv
         return rv
 
     def read_byte(self):
