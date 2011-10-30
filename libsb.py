@@ -272,10 +272,7 @@ class BytesPrimitiveWrapper(PrimitiveWrapper):
 
 
 class Blob(BytesPrimitiveWrapper):
-    """Represents a blob.  So far I have not found a file where the blob is
-    extra large but just in case the repr compresses it.  This mainly exists
-    so that the structure can be reversed without loss of data.
-    """
+    """Represents a blob."""
     __slots__ = ()
 
 
