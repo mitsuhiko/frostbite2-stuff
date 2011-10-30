@@ -64,9 +64,13 @@ class TypeReaderMixin(object):
     def read_varint(self):
         rv = 0
         while 1:
-            val = self.read_byte()
-            rv = (rv << 7) | (val & 0x7f)
-            if not val >> 7:
+            byte = self.read_byte()
+            val = byte & 0x7f
+            if rv == 0:
+                rv = val
+            else:
+                rv = (val << 7) | rv
+            if not byte >> 7:
                 break
         return rv
 
@@ -340,9 +344,6 @@ class SBParser(object):
         elif typecode == 16:
             self.push(SHA1(self.reader.read(20)))
         elif typecode == 19:
-            # XXX: either read_varint is broken or there is some extra
-            # information in there for the blobs.  It fails to read one
-            # of the beta files.
             size = self.reader.read_varint()
             self.push(Blob(self.reader.read(size)))
         else:
@@ -359,8 +360,9 @@ class SBParser(object):
         rv = []
         self.push(rv)
         size_info = self.reader.read_varint()
+        # We don't need the size_info since the collection is delimited
 
-        for x in xrange(size_info):
+        while 1:
             self.read_object()
             value = self.pop()
             if value is None:
@@ -376,7 +378,7 @@ class SBParser(object):
         size_info = self.reader.read_varint()
         # We don't need the size_info since the collection is delimited
 
-        for x in xrange(size_info):
+        while 1:
             typecode = self.reader.read_byte()
             if typecode == 0:
                 break
