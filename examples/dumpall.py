@@ -1,3 +1,7 @@
+"""
+A simple example script that dumps all the contents of the
+bundles onto the filesystem.
+"""
 import os
 import shutil
 from libsb import CASCatalog

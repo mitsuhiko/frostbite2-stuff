@@ -637,6 +637,10 @@ class CASCatalog(object):
         full_filename = os.path.join(directory, filename)
         return open(full_filename, 'rb')
 
+    def open_superbundle(self, name):
+        directory = os.path.dirname(self.filename)
+        return Bundle(os.path.join(directory, name), cat=self)
+
 
 def decrypt(filename, new_filename=None):
     """Decrypts a file for debugging."""
