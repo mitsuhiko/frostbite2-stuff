@@ -174,8 +174,24 @@ class BundleFileStream(TypeReaderMixin):
 
     def __init__(self, fp, limit):
         self._fp = fp
+        self._offset = fp.tell()
         self.limit = limit
         self.pos = 0
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, delta, how=0):
+        if how == 0:
+            target = max(0, min(delta, self.limit))
+        elif how == 1:
+            target = max(0, min(delta + self.pos, self.limit))
+        elif how == 2:
+            target = max(0, min(self.limit - delta, self.limit))
+        else:
+            raise ValueError('Invalid seek method')
+        self._fp.seek(self._offset + target, 0)
+        self.pos = target
 
     def read(self, length=None):
         if length is None:
@@ -194,14 +210,8 @@ class BundleFileStream(TypeReaderMixin):
             self._fp = None
 
 
-class BundleFile(object):
-
-    def __init__(self, bundle, id, offset, size):
-        self.bundle = bundle
-        self.id = id
-        self.offset = offset
-        self.size = size
-        self._parsed_contents = None
+class CommonFileMethodsMixin(object):
+    _parsed_contents = None
 
     def get_raw_contents(self):
         with self.open() as f:
@@ -213,6 +223,15 @@ class BundleFile(object):
         with self.open() as f:
             self._parsed_contents = rv = load(f)
             return rv
+
+
+class BundleFile(CommonFileMethodsMixin):
+
+    def __init__(self, bundle, id, offset, size):
+        self.bundle = bundle
+        self.id = id
+        self.offset = offset
+        self.size = size
 
     def iter_chunk_files(self):
         if self.bundle.cat is None:
@@ -563,7 +582,7 @@ class CASFileReader(TypeReaderMixin):
             self._fp.close()
 
 
-class CASFile(object):
+class CASFile(CommonFileMethodsMixin):
     """A single file from a CAS."""
 
     def __init__(self, sha1, offset, size, cas_num=-1,
@@ -574,10 +593,6 @@ class CASFile(object):
         self.size = size
         self.cas_num = cas_num
         self.cat = cat
-
-    def get_raw_contents(self):
-        with self.open() as f:
-            return f.read()
 
     def open(self):
         if self.fp is not None:
