@@ -105,7 +105,37 @@ class TypeReaderMixin(object):
             pass
 
 
-class SBReader(TypeReaderMixin):
+class LimitedReaderMixin(object):
+    """Adds tell/seek/close to a wrapped fp :attr:`_fp`.  The class has to
+    provide :attr:`pos` and :attr:`limit`.
+    """
+
+    @property
+    def eof(self):
+        return self.pos >= self.limit
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, delta, how=0):
+        if how == 0:
+            target = max(0, min(delta, self.limit))
+        elif how == 1:
+            target = max(0, min(delta + self.pos, self.limit))
+        elif how == 2:
+            target = max(0, min(self.limit - delta, self.limit))
+        else:
+            raise ValueError('Invalid seek method')
+        self._fp.seek(self._offset + target, 0)
+        self.pos = target
+
+    def close(self):
+        if self._fp is not None:
+            self._fp.close()
+            self._fp = None
+
+
+class SBReader(TypeReaderMixin, LimitedReaderMixin):
     """Reads optionally encrypted files.  If the file starts with the
     magic DICE header (00D1CE00) it's xor "encrypted" with the key of
     the encryption starting at `MAGIC_OFFSET`.  Otherwise it starts
@@ -144,20 +174,18 @@ class SBReader(TypeReaderMixin):
                 _fail_init('Magic incomplete')
 
         self._fp.seek(0, 2)
-        self.end = self._fp.tell() - data_offset
+        self.limit = self._fp.tell() - data_offset
         self._fp.seek(data_offset)
         self.pos = 0
 
-    @property
-    def eof(self):
-        return self.pos >= self.end
-
     def read(self, length=None):
         if length is None:
-            length = self.end - self.pos
+            length = self.limit - self.pos
+        else:
+            length = min(length, self.limit - self.pos)
         data = array('c', self._fp.read(length))
         if len(data) != length:
-            raise SBException('Unexpected end of file')
+            raise SBException('Unexpected limit of file')
         if self.magic is not None:
             for off, b in enumerate(imap(ord, data)):
                 i = self.pos + off
@@ -167,31 +195,46 @@ class SBReader(TypeReaderMixin):
 
     def close(self):
         if self._managed_fp:
-            self._fp.close()
+            super(SBReader, self).close()
 
 
-class BundleFileStream(TypeReaderMixin):
+class CommonFileAccessMethodsMixin(object):
+    """Assumes that give accsess to a file returned by the :meth:`open`
+    method of the class.
+    """
+    _parsed_contents = None
+
+    def get_raw_contents(self):
+        with self.open() as f:
+            return f.read()
+
+    def iter_parse_contents(self, selector):
+        with self.open() as f:
+            for obj in iterload(f, selector):
+                yield obj
+
+    def get_parsed_contents(self, cache=True):
+        if self._parsed_contents is not None:
+            return self._parsed_contents
+        with self.open() as f:
+            rv = load(f)
+            if cache:
+                self._parsed_contents = rv
+            return rv
+
+
+class NestedFileStream(TypeReaderMixin, LimitedReaderMixin):
+    """Works similar to a regular Python file but does not support
+    readline on the other hand it provides everything a type reader
+    also provides which makes it possible to use this file for
+    parsing.
+    """
 
     def __init__(self, fp, limit):
         self._fp = fp
         self._offset = fp.tell()
         self.limit = limit
         self.pos = 0
-
-    def tell(self):
-        return self.pos
-
-    def seek(self, delta, how=0):
-        if how == 0:
-            target = max(0, min(delta, self.limit))
-        elif how == 1:
-            target = max(0, min(delta + self.pos, self.limit))
-        elif how == 2:
-            target = max(0, min(self.limit - delta, self.limit))
-        else:
-            raise ValueError('Invalid seek method')
-        self._fp.seek(self._offset + target, 0)
-        self.pos = target
 
     def read(self, length=None):
         if length is None:
@@ -204,28 +247,8 @@ class BundleFileStream(TypeReaderMixin):
         self.pos += length
         return rv
 
-    def close(self):
-        if self._fp is not None:
-            self._fp.close()
-            self._fp = None
 
-
-class CommonFileMethodsMixin(object):
-    _parsed_contents = None
-
-    def get_raw_contents(self):
-        with self.open() as f:
-            return f.read()
-
-    def get_parsed_contents(self):
-        if self._parsed_contents is not None:
-            return self._parsed_contents
-        with self.open() as f:
-            self._parsed_contents = rv = load(f)
-            return rv
-
-
-class BundleFile(CommonFileMethodsMixin):
+class BundleFile(CommonFileAccessMethodsMixin):
 
     def __init__(self, bundle, id, offset, size):
         self.bundle = bundle
@@ -243,7 +266,7 @@ class BundleFile(CommonFileMethodsMixin):
     def open(self):
         f = open(self.bundle.basename + '.sb', 'rb')
         f.seek(self.offset)
-        return BundleFileStream(f, self.size)
+        return NestedFileStream(f, self.size)
 
     def __repr__(self):
         return '<BundleFile %r>' % self.id
@@ -323,6 +346,9 @@ class SBParser(object):
     """Parses SB/Superbundle files.  Each value read is put on on a stack
     temporarily until something else consumes it.  Even things such as
     dictionary keys end up on there temporarily to aid debugging.
+
+    Instead of using this use :meth:`load`, :meth:`loads`, :meth:`iterload`
+    and :meth:`iterloads`.
     """
 
     def __init__(self, reader):
@@ -364,22 +390,21 @@ class SBParser(object):
         if isinstance(selector, basestring):
             selector = [x.strip() for x in selector.split(',')]
         selectors = [self.parse_selector(x) for x in selector]
-
-        def selector_matches(selector, stack):
-            if len(stack) != len(selector):
-                return False
-            for stack_part, selector_part in izip(stack, selector):
-                if selector_part is not None and \
-                   selector_part != stack_part:
-                    return False
-            return True
-
         def selector_func(stack):
             for selector in selectors:
-                if selector_matches(selector, stack):
+                if self.selector_matches(selector, stack):
                     return True
             return False
         return selector_func
+
+    def selector_matches(self, selector, stack):
+        if len(stack) != len(selector):
+            return False
+        for stack_part, selector_part in izip(stack, selector):
+            if selector_part is not None and \
+               selector_part != stack_part:
+                return False
+        return True
 
     def parse_selector(self, selector):
         test_selector = []
@@ -524,14 +549,15 @@ class Bundle(object):
 
     def list_files(self):
         """Lists all files in the bundle."""
-        result = []
-        for bundle in self.root['bundles']:
-            result.append(bundle['id'])
-        return result
+        return self.bundle_files.values()
+
+    def iter_files(self):
+        """Iterates oveo all files in the bundle."""
+        return self.bundle_files.itervalues()
 
     def get_file(self, id):
         """Opens a file by id."""
-        return self.bundle_files[id]
+        return self.bundle_files.get(id)
 
 
 class CASFileReader(TypeReaderMixin):
@@ -548,13 +574,19 @@ class CASFileReader(TypeReaderMixin):
             self._fp = open(fp_or_filename, 'rb')
             self._managed_fp = True
 
+    def tell(self):
+        return self._fp.tell()
+
+    def seek(self, delta, how=0):
+        return self._fp.seek(delta, how)
+
     def read(self, length=None):
         return self._fp.read(length or -1)
 
     def get_next_file(self):
         header = self.read(4)
         if not header:
-            raise EOFError()
+            return None
         if header != CAS_HEADER:
             raise ValueError('Expected cas header, got %r' % header)
         sha1 = SHA1(self.read(20))
@@ -566,10 +598,10 @@ class CASFileReader(TypeReaderMixin):
 
     def __iter__(self):
         while 1:
-            try:
-                yield self.get_next_file()
-            except EOFError:
+            f = self.get_next_file()
+            if f is None:
                 break
+            yield f
 
     def __del__(self):
         try:
@@ -582,7 +614,7 @@ class CASFileReader(TypeReaderMixin):
             self._fp.close()
 
 
-class CASFile(CommonFileMethodsMixin):
+class CASFile(CommonFileAccessMethodsMixin):
     """A single file from a CAS."""
 
     def __init__(self, sha1, offset, size, cas_num=-1,
@@ -600,7 +632,7 @@ class CASFile(CommonFileMethodsMixin):
         else:
             f = self.cat.open_cas(self.cas_num)
         f.seek(self.offset)
-        return BundleFileStream(f, self.size)
+        return NestedFileStream(f, self.size)
 
     def __repr__(self):
         return '<CASFile %r>' % self.sha1.hex
@@ -626,20 +658,29 @@ class CASCatalog(object):
                                                cat=self)
 
     def get_file(self, sha1):
-        return self.files[sha1]
-
-    def read(self, length=None):
-        return self._fp.read(length or -1)
+        """Returns a file by its sha1 checksum."""
+        if hasattr(sha1, 'hex'):
+            sha1 = sha1.hex
+        return self.files.get(sha1)
 
     def open_cas(self, num):
+        """Opens a CAS by number.  This is usually not needed to use directly
+        since :meth:`get_file` opens the CAS as necessary.
+        """
         directory, base = os.path.split(self.filename)
         filename = '%s_%02d.cas' % (os.path.splitext(base)[0], num)
         full_filename = os.path.join(directory, filename)
-        return open(full_filename, 'rb')
+        if os.path.isfile(full_filename):
+            return open(full_filename, 'rb')
 
     def open_superbundle(self, name):
+        """Opens a superbundle that is relative to the CAS catalog.  This bundle
+        has to have a .toc and a .sb file.
+        """
         directory = os.path.dirname(self.filename)
-        return Bundle(os.path.join(directory, name), cat=self)
+        basename = os.path.join(directory, name)
+        if os.path.isfile(basename + '.toc'):
+            return Bundle(basename, cat=self)
 
 
 def decrypt(filename, new_filename=None):
