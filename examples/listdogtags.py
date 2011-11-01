@@ -2,7 +2,7 @@
 A simple example script that iterates over the dogtag definitions
 that can be found in the default_settings bundle.
 """
-from libsb import CASCatalog
+from libfb2.sb import CASCatalog
 
 
 CAS_PATH = r'C:\Program Files (x86)\Origin Games\Battlefield 3\Data\cas.cat'

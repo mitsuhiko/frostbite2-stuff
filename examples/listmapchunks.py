@@ -2,11 +2,11 @@
 A simple example script that iterates over the data of
 a given map.
 """
-from libsb import CASCatalog
+from libfb2.sb import CASCatalog
 
 
 CAS_PATH = r'C:\Program Files (x86)\Origin Games\Battlefield 3\Data\cas.cat'
-MAP = 'MP_011'
+MAP = 'MP_001'
 cat = CASCatalog(CAS_PATH)
 
 

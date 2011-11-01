@@ -4,7 +4,7 @@ bundles onto the filesystem.
 """
 import os
 import shutil
-from libsb import CASCatalog
+from libfb2.sb import CASCatalog
 
 
 def dump_all(source, dst):

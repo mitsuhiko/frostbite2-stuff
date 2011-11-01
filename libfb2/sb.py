@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-    libsb
-    ~~~~~
+    libfb2.sb
+    ~~~~~~~~~
 
     Reads frostbite2 sb and toc files.  Thanks to gibbed for the original
     analysis of the XOR trick for the obfuscation.
@@ -10,35 +10,17 @@
     :license: BSD, see LICENSE for more details.
 """
 import os
-import struct
+import shutil
 from StringIO import StringIO
 from uuid import UUID
-from array import array
-from itertools import imap, count, izip, chain
-from datetime import datetime
+from itertools import izip, chain
+
+from .utils import TypeReader, DecryptingTypeReader, \
+     open_fp_or_filename
 
 
-DICE_HEADER = '\x00\xd1\xce\x00'
-HASH_OFFSET = 0x08
-HASH_SIZE = 256
-MAGIC_OFFSET = 0x0128
-MAGIC_SIZE = 257
-MAGIC_XOR = 0x7b
-DATA_OFFSET = 0x022c
 CAS_CAT_HEADER = 'Nyan' * 4
 CAS_HEADER = '\xfa\xce\x0f\xf0'
-
-
-_structcache = {}
-
-
-def get_cached_struct(typecode):
-    if isinstance(typecode, struct.Struct):
-        return typecode
-    rv = _structcache.get(typecode)
-    if rv is None:
-        _structcache[typecode] = rv = struct.Struct(typecode)
-    return rv
 
 
 def generate_one(item):
@@ -51,151 +33,6 @@ class SBException(Exception):
 
 class CASException(Exception):
     pass
-
-
-class TypeReaderMixin(object):
-
-    def read_st(self, typecode, arch='<'):
-        st = get_cached_struct(arch + typecode)
-        data = self.read(st.size)
-        return st.unpack(data)
-
-    def read_sst(self, typecode, arch='<'):
-        rv = self.read_st(typecode, arch)
-        assert len(rv) == 1, 'Expected exactly one item, got %d' % len(rv)
-        return rv[0]
-
-    def read_varint(self):
-        rv = 0
-        for idx in count():
-            byte = self.read_byte()
-            rv |= (byte & 0x7f) << (7 * idx)
-            if not byte >> 7:
-                break
-        return rv
-
-    def read_byte(self):
-        return ord(self.read(1))
-
-    def read_cstring(self):
-        rv = []
-        while 1:
-            c = self.read(1)
-            if c == '\x00':
-                break
-            rv.append(c)
-        return ''.join(rv)
-
-    def read_bstring(self):
-        rv = self.read(self.read_varint())
-        if not rv or rv[-1] != '\x00':
-            raise SBException('missing bstring delimiter')
-        return rv[:-1]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, tb):
-        self.close()
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-class LimitedReaderMixin(object):
-    """Adds tell/seek/close to a wrapped fp :attr:`_fp`.  The class has to
-    provide :attr:`pos` and :attr:`limit`.
-    """
-
-    @property
-    def eof(self):
-        return self.pos >= self.limit
-
-    def tell(self):
-        return self.pos
-
-    def seek(self, delta, how=0):
-        if how == 0:
-            target = max(0, min(delta, self.limit))
-        elif how == 1:
-            target = max(0, min(delta + self.pos, self.limit))
-        elif how == 2:
-            target = max(0, min(self.limit - delta, self.limit))
-        else:
-            raise ValueError('Invalid seek method')
-        self._fp.seek(self._offset + target, 0)
-        self.pos = target
-
-    def close(self):
-        if self._fp is not None:
-            self._fp.close()
-            self._fp = None
-
-
-class SBReader(TypeReaderMixin, LimitedReaderMixin):
-    """Reads optionally encrypted files.  If the file starts with the
-    magic DICE header (00D1CE00) it's xor "encrypted" with the key of
-    the encryption starting at `MAGIC_OFFSET`.  Otherwise it starts
-    reading the data direction from the first byte.
-    """
-
-    def __init__(self, fp_or_filename):
-        if hasattr(fp_or_filename, 'read'):
-            self._fp = fp_or_filename
-            self._managed_fp = False
-        else:
-            self._fp = open(fp_or_filename, 'rb')
-            self._managed_fp = True
-
-        def _fail_init(message):
-            self.close()
-            raise SBException(message)
-
-        header = self._fp.read(len(DICE_HEADER))
-        if header != DICE_HEADER:
-            self.hash = None
-            self.magic = None
-            data_offset = 0
-        else:
-            data_offset = DATA_OFFSET
-            self._fp.seek(HASH_OFFSET)
-            if self._fp.read(1) != 'x':
-                _fail_init('Hash start marker not found')
-            self.hash = self._fp.read(HASH_SIZE)
-            if self._fp.read(1) != 'x':
-                _fail_init('Hash end marker not found')
-
-            self._fp.seek(MAGIC_OFFSET)
-            self.magic = map(ord, self._fp.read(MAGIC_SIZE))
-            if len(self.magic) != MAGIC_SIZE:
-                _fail_init('Magic incomplete')
-
-        self._fp.seek(0, 2)
-        self.limit = self._fp.tell() - data_offset
-        self._fp.seek(data_offset)
-        self.pos = 0
-
-    def read(self, length=None):
-        if length is None:
-            length = self.limit - self.pos
-        else:
-            length = min(length, self.limit - self.pos)
-        data = array('c', self._fp.read(length))
-        if len(data) != length:
-            raise SBException('Unexpected limit of file')
-        if self.magic is not None:
-            for off, b in enumerate(imap(ord, data)):
-                i = self.pos + off
-                data[off] = chr(b ^ self.magic[i % MAGIC_SIZE] ^ MAGIC_XOR)
-        self.pos += length
-        return data.tostring()
-
-    def close(self):
-        if self._managed_fp:
-            super(SBReader, self).close()
 
 
 class CommonFileAccessMethodsMixin(object):
@@ -223,31 +60,6 @@ class CommonFileAccessMethodsMixin(object):
             return rv
 
 
-class NestedFileStream(TypeReaderMixin, LimitedReaderMixin):
-    """Works similar to a regular Python file but does not support
-    readline on the other hand it provides everything a type reader
-    also provides which makes it possible to use this file for
-    parsing.
-    """
-
-    def __init__(self, fp, limit):
-        self._fp = fp
-        self._offset = fp.tell()
-        self.limit = limit
-        self.pos = 0
-
-    def read(self, length=None):
-        if length is None:
-            length = self.limit - self.pos
-        else:
-            length = min(length, self.limit - self.pos)
-        rv = self._fp.read(length)
-        if len(rv) != length:
-            raise SBException('Unexpected end of file')
-        self.pos += length
-        return rv
-
-
 class BundleFile(CommonFileAccessMethodsMixin):
 
     def __init__(self, bundle, id, offset, size):
@@ -266,7 +78,7 @@ class BundleFile(CommonFileAccessMethodsMixin):
     def open(self):
         f = open(self.bundle.basename + '.sb', 'rb')
         f.seek(self.offset)
-        return NestedFileStream(f, self.size)
+        return TypeReader(f, self.size)
 
     def __repr__(self):
         return '<BundleFile %r>' % self.id
@@ -560,58 +372,22 @@ class Bundle(object):
         return self.bundle_files.get(id)
 
 
-class CASFileReader(TypeReaderMixin):
-    """Reads CAS files without the help of the catalog.  This is mainly
-    useful for dumping everything in case someone forgot to add an entry
-    into the .cat.  It can only read one file after another.
-    """
-
-    def __init__(self, fp_or_filename):
-        if hasattr(fp_or_filename, 'read'):
-            self._fp = fp_or_filename
-            self._managed_fp = False
-        else:
-            self._fp = open(fp_or_filename, 'rb')
-            self._managed_fp = True
-
-    def tell(self):
-        return self._fp.tell()
-
-    def seek(self, delta, how=0):
-        return self._fp.seek(delta, how)
-
-    def read(self, length=None):
-        return self._fp.read(length or -1)
-
-    def get_next_file(self):
-        header = self.read(4)
-        if not header:
-            return None
-        if header != CAS_HEADER:
-            raise ValueError('Expected cas header, got %r' % header)
-        sha1 = SHA1(self.read(20))
-        data_length = self.read_sst('i')
-        padding = self.read(4)
-        rv = CASFile(sha1, self._fp.tell(), data_length, fp=self._fp)
-        self._fp.seek(data_length, 1)
-        return rv
-
-    def __iter__(self):
+def iter_cas_file(fp_or_filename):
+    """Iterates over all files in a CAS."""
+    with open_fp_or_filename(fp_or_filename) as f:
+        reader = TypeReader(f)
         while 1:
-            f = self.get_next_file()
-            if f is None:
+            header = self.read(4)
+            if not header:
                 break
-            yield f
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def close(self):
-        if self._managed_fp:
-            self._fp.close()
+            if header != CAS_HEADER:
+                raise ValueError('Expected cas header, got %r' % header)
+            sha1 = SHA1(self.read(20))
+            data_length = self.read_sst('i')
+            padding = self.read(4)
+            rv = CASFile(sha1, self._fp.tell(), data_length, fp=self._fp)
+            self._fp.seek(data_length, 1)
+            yield rv
 
 
 class CASFile(CommonFileAccessMethodsMixin):
@@ -632,7 +408,7 @@ class CASFile(CommonFileAccessMethodsMixin):
         else:
             f = self.cat.open_cas(self.cas_num)
         f.seek(self.offset)
-        return NestedFileStream(f, self.size)
+        return TypeReader(f, self.size)
 
     def __repr__(self):
         return '<CASFile %r>' % self.sha1.hex
@@ -645,7 +421,7 @@ class CASCatalog(object):
         self.filename = os.path.abspath(filename)
         self.files = {}
         with open(filename, 'rb') as f:
-            reader = SBReader(f)
+            reader = DecryptingTypeReader(f)
             header = reader.read(len(CAS_CAT_HEADER))
             if header != CAS_CAT_HEADER:
                 raise ValueError('Not a cas cat file')
@@ -688,8 +464,8 @@ def decrypt(filename, new_filename=None):
     if new_filename is None:
         new_filename = filename + '.decrypt'
     with open(new_filename, 'wb') as f:
-        with SBReader(filename) as reader:
-            f.write(reader.read())
+        with DecryptingTypeReader(filename) as reader:
+            shutil.copyfileobj(reader, f)
 
 
 def loads(string):
@@ -697,9 +473,10 @@ def loads(string):
     return load(StringIO(string))
 
 
-def load(filename_or_fp):
+def load(fp_or_filename):
     """Loads an SB object from a file."""
-    with SBReader(filename_or_fp) as reader:
+    with open_fp_or_filename(fp_or_filename) as f:
+        reader = DecryptingTypeReader(f)
         return SBParser(reader).parse()
 
 
@@ -708,8 +485,9 @@ def iterloads(string, selector):
     return iterload(StringIO(string), selector)
 
 
-def iterload(filename_or_fp, selector):
+def iterload(fp_or_filename, selector):
     """Loads SB objects iteratively from from a file that match a selector."""
-    with SBReader(filename_or_fp) as reader:
+    with open_fp_or_filename(fp_or_filename) as f:
+        reader = DecryptingTypeReader(f)
         for obj in SBParser(reader).iterparse(selector):
             yield obj
