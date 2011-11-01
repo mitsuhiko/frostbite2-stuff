@@ -17,6 +17,7 @@ from itertools import izip, chain
 
 from .utils import TypeReader, DecryptingTypeReader, \
      open_fp_or_filename
+from .types import Blob, SHA1, Unknown
 
 
 CAS_CAT_HEADER = 'Nyan' * 4
@@ -82,76 +83,6 @@ class BundleFile(CommonFileAccessMethodsMixin):
 
     def __repr__(self):
         return '<BundleFile %r>' % self.id
-
-
-class PrimitiveWrapper(object):
-    __slots__ = ()
-
-    @property
-    def primitive(self):
-        raise NotImplementedError()
-
-    def __hash__(self):
-        return hash(self.primitive)
-
-    def __eq__(self, other):
-        if type(self) is not type(other):
-            return False
-        return self.primitive == other.primitive
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __repr__(self):
-        rv = self.primitive
-        if isinstance(rv, basestring):
-            rv = repr(rv)
-        return '<%s %s>' % (self.__class__.__name__, rv)
-
-
-class BytesPrimitiveWrapper(PrimitiveWrapper):
-    __slots__ = ('bytes',)
-
-    def __init__(self, bytes):
-        self.bytes = bytes
-
-    def __len__(self):
-        return len(self.bytes)
-
-    def __str__(self):
-        return str(self.bytes)
-
-    @property
-    def primitive(self):
-        return self.bytes
-
-
-class Blob(BytesPrimitiveWrapper):
-    """Represents a blob."""
-    __slots__ = ()
-
-
-class SHA1(BytesPrimitiveWrapper):
-    """SHA1 hashes are used for content hashes as it seems."""
-    __slots__ = ()
-
-    def __init__(self, bytes):
-        self.bytes = bytes
-
-    @property
-    def hex(self):
-        return self.bytes.encode('hex')
-
-    def __repr__(self):
-        return '<SHA1 %s>' % self.hex
-
-
-class Unknown(BytesPrimitiveWrapper):
-    __slots__ = ('code',)
-
-    def __init__(self, code, bytes):
-        self.code = code
-        self.bytes = bytes
 
 
 class SBParser(object):
